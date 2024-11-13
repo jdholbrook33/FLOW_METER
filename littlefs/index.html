@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Pool Flow Monitor</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="stylesheet" href="/css/style.css">
+        <script src="/js/chart.umd.js"></script>
+    </head>
+<body>
+    <div class="container">
+        <h1>Pool Flow Monitor</h1>
+        
+        <div class="readings-grid">
+            <div class="reading-card">
+                <div class="reading-label">Current Flow Rate</div>
+                <div class="reading-value">
+                    <span id="flow-rate">0.00</span>
+                    <span class="reading-unit">L/min</span>
+                </div>
+            </div>
+            <div class="reading-card">
+                <div class="reading-label">Total Volume</div>
+                <div class="reading-value">
+                    <span id="total-volume">0.00</span>
+                    <span class="reading-unit">L</span>
+                </div>
+            </div>
+            <div class="reading-card">
+                <div class="reading-label">Last Updated</div>
+                <div class="reading-value">
+                    <span id="update-time">--:--:--</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="flowChart"></canvas>
+        </div>
+        <div class="controls time-controls">
+            <label for="logging-interval">Select Logging Interval:</label>
+            <select id="logging-interval">
+                <option value="2000">2 Seconds</option>
+                <option value="5000">5 Seconds</option>
+                <option value="10000">10 Seconds</option>
+            </select>
+            <button onclick="setLoggingInterval()">Set Interval</button>
+        </div>
+        <div class="controls time-controls">
+            <button onclick="setTimePeriod('hour')">1 Hour</button>
+            <button onclick="setTimePeriod('day')">1 Day</button>
+            <button onclick="setTimePeriod('month')">1 Month</button>
+        </div>
+        <div class="controls file-controls">
+            <button onclick="downloadData()">Save to File</button>
+            <button onclick="updateData()">Refresh Data</button>
+        </div>
+        
+    </div>
+
+    <script src="/js/main.js"></script>
+    <script src="/js/charts.js"></script>
+</body>
+</html>

@@ -1,0 +1,107 @@
+body {
+    font-family: Arial, sans-serif;
+    margin: 20px;
+    background-color: #121212;  /* Dark background */
+    color: #ffffff;
+}
+
+.container {
+    background-color: #1e1e1e;  /* Slightly lighter than background */
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+h1 {
+    color: #00E5FF;  /* Lighter blue */
+    margin-bottom: 30px;
+}
+
+.readings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 20px;
+    margin-bottom: 30px;
+}
+
+.reading-card {
+    background: #2d2d2d;  /* Dark card background */
+    padding: 15px;
+    border-radius: 8px;
+    text-align: center;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    transition: transform 0.2s ease; /* Transition for hover effect */
+}
+
+.reading-label {
+    font-size: 14px;
+    color: #9e9e9e;  /* Light gray */
+    margin-bottom: 5px;
+}
+
+.reading-value {
+    font-size: 24px;
+    font-weight: bold;
+    color: #ffffff;  /* White for better contrast */
+}
+
+.reading-unit {
+    font-size: 14px;
+    color: #9e9e9e;  /* Light gray */
+}
+
+.chart-container {
+    margin-top: 20px;
+    height: 400px;
+    position: relative;
+    background: #2d2d2d;  /* Dark chart background */
+    padding: 15px;
+    border-radius: 8px;
+}
+
+.controls {
+    margin-top: 20px;
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+}
+
+button {
+    background-color: #0073ff;  /* Electric Blue */
+    color: white;
+    border: none;
+    padding: 8px 16px;     /* Smaller padding for more compact buttons */
+    border-radius: 4px;
+    font-size: 14px;       /* Reduced font size for smaller buttons */
+    margin: 5px;           /* Less space between buttons */
+    min-width: 100px;      /* Smaller minimum width */
+    cursor: pointer;
+    touch-action: manipulation; /* Optimize for touch */
+    -webkit-tap-highlight-color: rgba(0,0,0,0); /* Remove tap highlight on iOS */
+    transition: background-color 0.3s ease, transform 0.2s ease; /* Smooth transitions */
+}
+
+.time-controls {
+    margin-bottom: 15px;
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+}
+
+.file-controls {
+    margin-top: 10px;
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+}
+
+
+
+button:active {  /* Use active for touch feedback */
+    background-color: #33EAFF;
+    transform: scale(0.98);  /* Slight press effect */
+}
+
+ 

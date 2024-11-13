@@ -1,0 +1,163 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "led_strip.h"
+
+static const char *TAG = "FLOW_METER";
+#define PULSE_GPIO GPIO_NUM_3       // GPIO pin for pulse input
+#define LED_GPIO GPIO_NUM_8         // GPIO pin for WS2812 LED
+#define BUFFER_SIZE 10              // Size of rolling average buffer
+#define UPDATE_INTERVAL_MS 1000     // Update interval in milliseconds
+#define PULSES_PER_LITER 300.0     // Flow meter calibration factor
+#define PULSE_TIMEOUT_MS 1000       // LED timeout if no pulses received
+
+volatile uint32_t pulse_count = 0;
+static led_strip_handle_t led_strip;
+TaskHandle_t led_control_task_handle = NULL;
+TaskHandle_t flow_calc_task_handle = NULL;
+volatile uint32_t last_pulse_time = 0;
+
+// Statistics tracking
+static struct {
+    float min_flow_rate;
+    float max_flow_rate;
+    float total_volume;
+    uint32_t samples_count;
+} flow_stats = {
+    .min_flow_rate = 99999.0,
+    .max_flow_rate = 0.0,
+    .total_volume = 0.0,
+    .samples_count = 0
+};
+
+// Circular buffer for rolling average
+static struct {
+    uint32_t buffer[BUFFER_SIZE];
+    int index;
+    bool buffer_full;
+} pulse_buffer = {.index = 0, .buffer_full = false};
+
+// Interrupt handler for pulse counting
+void IRAM_ATTR pulse_isr_handler(void* arg) {
+    pulse_count++;
+    last_pulse_time = xTaskGetTickCount();
+}
+
+// Task to control LED based on pulse reception
+void led_control_task(void *pvParameters) {
+    bool led_state = false;
+    while (1) {
+        uint32_t current_time = xTaskGetTickCount();
+        // Check if we've received pulses recently
+        if ((current_time - last_pulse_time) < pdMS_TO_TICKS(PULSE_TIMEOUT_MS)) {
+            if (!led_state) {
+                led_strip_set_pixel(led_strip, 0, 16, 16, 16);
+                led_strip_refresh(led_strip);
+                led_state = true;
+            }
+        } else {
+            if (led_state) {
+                led_strip_clear(led_strip);
+                led_strip_refresh(led_strip);
+                led_state = false;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));  // Check LED state every 100ms
+    }
+}
+
+// Calculate rolling average of pulse counts
+float calculate_rolling_average(uint32_t new_count) {
+    pulse_buffer.buffer[pulse_buffer.index] = new_count;
+    pulse_buffer.index = (pulse_buffer.index + 1) % BUFFER_SIZE;
+    
+    if (pulse_buffer.index == 0) {
+        pulse_buffer.buffer_full = true;
+    }
+
+    uint32_t sum = 0;
+    int count = pulse_buffer.buffer_full ? BUFFER_SIZE : pulse_buffer.index;
+    
+    for (int i = 0; i < count; i++) {
+        sum += pulse_buffer.buffer[i];
+    }
+    
+    return (float)sum / count;
+}
+
+// Task to calculate and display flow rate
+void flow_calc_task(void *pvParameters) {
+    TickType_t last_wake_time = xTaskGetTickCount();
+    uint32_t last_count = 0;
+    
+    while (1) {
+        uint32_t current_count = pulse_count;
+        uint32_t pulses = current_count - last_count;
+        last_count = current_count;
+        
+        // Calculate pulses per minute (multiply by 60 since we're sampling every second)
+        float pulses_per_minute = calculate_rolling_average(pulses) * 60;
+        
+        // Convert to liters per minute
+        float liters_per_minute = pulses_per_minute / PULSES_PER_LITER;
+        
+        // Update statistics
+        if (liters_per_minute > 0) {  // Only update stats if we're receiving flow
+            flow_stats.min_flow_rate = MIN(flow_stats.min_flow_rate, liters_per_minute);
+            flow_stats.max_flow_rate = MAX(flow_stats.max_flow_rate, liters_per_minute);
+            flow_stats.total_volume += liters_per_minute / 60.0;  // Convert to liters per second for volume
+            flow_stats.samples_count++;
+        }
+        
+        // Log the results
+        ESP_LOGI(TAG, "Flow Rate: %.2f L/min (%.0f pulses/min)", 
+                 liters_per_minute, pulses_per_minute);
+        
+        // Log statistics every 5 seconds
+        if (flow_stats.samples_count % 5 == 0) {
+            ESP_LOGI(TAG, "Stats - Min: %.2f L/min, Max: %.2f L/min, Total: %.2f L",
+                     flow_stats.min_flow_rate, flow_stats.max_flow_rate, flow_stats.total_volume);
+        }
+        
+        // Wait for the next second
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(UPDATE_INTERVAL_MS));
+    }
+}
+
+// Configure pulse input pin with interrupt
+void configure_pulse_input() {
+    gpio_set_direction(PULSE_GPIO, GPIO_MODE_INPUT);
+    gpio_set_intr_type(PULSE_GPIO, GPIO_INTR_POSEDGE);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PULSE_GPIO, pulse_isr_handler, NULL);
+}
+
+// Configure WS2812 LED
+void configure_led_output() {
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = LED_GPIO,
+        .max_leds = 1,
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000,
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    led_strip_clear(led_strip);
+}
+
+void app_main(void) {
+    configure_led_output();
+    configure_pulse_input();
+
+    // Create the LED control task
+    xTaskCreate(led_control_task, "led_control_task", 2048, NULL, 10, &led_control_task_handle);
+    
+    // Create the flow calculation task
+    xTaskCreate(flow_calc_task, "flow_calc_task", 2048, NULL, 5, &flow_calc_task_handle);
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}

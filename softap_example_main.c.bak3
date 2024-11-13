@@ -1,0 +1,362 @@
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_mac.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "esp_http_server.h"
+#include "esp_system.h"
+#include "esp_netif.h"
+#include "driver/gpio.h"
+#include "esp_littlefs.h"
+#include <sys/stat.h>
+#include <dirent.h>
+
+#define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
+#define EXAMPLE_ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
+#define EXAMPLE_ESP_WIFI_CHANNEL   CONFIG_ESP_WIFI_CHANNEL
+#define EXAMPLE_MAX_STA_CONN       CONFIG_ESP_MAX_STA_CONN
+#define PULSE_GPIO GPIO_NUM_3      // GPIO pin for pulse input
+#define PULSES_PER_LITER 300      // Flow meter calibration
+
+// Add these definitions at the top of the file with other includes
+#define FILE_PATH_MAX 255
+#define CHUNK_SIZE 1024
+
+static const char *TAG = "FLOW_METER";
+static httpd_handle_t server = NULL;
+
+// Function to get content type based on file extension
+static const char* get_content_type(const char* path) {
+    const char* ext = strrchr(path, '.');
+    if (ext) {
+        if (strcmp(ext, ".html") == 0) return "text/html";
+        if (strcmp(ext, ".css") == 0) return "text/css";
+        if (strcmp(ext, ".js") == 0) return "application/javascript";
+        if (strcmp(ext, ".json") == 0) return "application/json";
+    }
+    return "text/plain";
+}
+
+// Global variables for flow measurement
+volatile uint32_t pulse_count = 0;
+static float current_flow_rate = 0.0;
+static float total_volume = 0.0;
+
+
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    char filepath[FILE_PATH_MAX];
+    FILE *fd = NULL;
+    struct stat file_stat;
+
+    ESP_LOGI(TAG, "Received request for URI: %s", req->uri);
+
+    // Handle /data endpoint separately
+    if (strcmp(req->uri, "/data") == 0) {
+        char json_response[128];
+        char time_str[20];
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        strftime(time_str, sizeof(time_str), "%H:%M:%S", localtime(&tv.tv_sec));
+        
+        snprintf(json_response, sizeof(json_response),
+                "{\"flow\":%.2f,\"volume\":%.2f,\"time\":\"%s\"}",
+                current_flow_rate, total_volume, time_str);
+        
+        ESP_LOGI(TAG, "Sending data response: %s", json_response);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, json_response, strlen(json_response));
+        return ESP_OK;
+    }
+
+    // For root path, serve index.html
+    if (strcmp(req->uri, "/") == 0) {
+        strlcpy(filepath, "/littlefs/index.html", FILE_PATH_MAX);
+        ESP_LOGI(TAG, "Root path requested, serving: %s", filepath);
+    } else {
+        // Ensure path starts with /littlefs/
+        if (strncmp(req->uri, "/littlefs/", 10) == 0) {
+            // Path already contains /littlefs/, copy as is
+            strlcpy(filepath, req->uri, FILE_PATH_MAX);
+            ESP_LOGI(TAG, "LittleFS path detected, serving: %s", filepath);
+        } else {
+            // Remove leading slash if present
+            const char *uri_path = req->uri[0] == '/' ? req->uri + 1 : req->uri;
+            // Combine with /littlefs/ prefix
+            if (snprintf(filepath, FILE_PATH_MAX, "/littlefs/%s", uri_path) >= FILE_PATH_MAX) {
+                ESP_LOGE(TAG, "Path too long: %s", uri_path);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Path too long");
+                return ESP_FAIL;
+            }
+            ESP_LOGI(TAG, "Constructed path: %s", filepath);
+        }
+    }
+
+    // Get file stats
+    if (stat(filepath, &file_stat) == -1) {
+        ESP_LOGE(TAG, "Failed to stat file: %s", filepath);
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File does not exist");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Opening file: %s (size: %ld)", filepath, file_stat.st_size);
+    fd = fopen(filepath, "r");
+    if (!fd) {
+        ESP_LOGE(TAG, "Failed to read file: %s", filepath);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read file");
+        return ESP_FAIL;
+    }
+
+    // Set content type based on file extension
+    const char* content_type = get_content_type(filepath);
+    ESP_LOGI(TAG, "Setting content type: %s", content_type);
+    httpd_resp_set_type(req, content_type);
+
+    // Read and send file
+    char *chunk = malloc(CHUNK_SIZE);
+    if (chunk == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for chunk");
+        fclose(fd);
+        return ESP_FAIL;
+    }
+
+    size_t chunksize;
+    size_t total_sent = 0;
+    do {
+        chunksize = fread(chunk, 1, CHUNK_SIZE, fd);
+        if (chunksize > 0) {
+            if (httpd_resp_send_chunk(req, chunk, chunksize) != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to send chunk");
+                free(chunk);
+                fclose(fd);
+                return ESP_FAIL;
+            }
+            total_sent += chunksize;
+        }
+    } while (chunksize != 0);
+
+    ESP_LOGI(TAG, "File sent successfully. Total bytes: %d", total_sent);
+    free(chunk);
+    fclose(fd);
+    return ESP_OK;
+}
+
+
+// Interrupt handler for pulse counting
+void IRAM_ATTR pulse_isr_handler(void* arg) {
+    pulse_count++;
+}
+
+// Add the list_dir function definition (we had it in the previous test)
+void list_dir(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) {
+        ESP_LOGE(TAG, "Failed to open directory %s", path);
+        return;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        char full_path[300];
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+        struct stat st;
+        if (stat(full_path, &st) == 0) {
+            ESP_LOGI(TAG, "Found file: %s, size: %ld", entry->d_name, st.st_size);
+        }
+    }
+    closedir(dir);
+}
+
+// Flow calculation task
+void flow_calc_task(void *pvParameters) {
+    TickType_t last_wake_time = xTaskGetTickCount();
+    uint32_t last_count = 0;
+    
+    while (1) {
+        uint32_t current_count = pulse_count;
+        uint32_t pulses = current_count - last_count;
+        last_count = current_count;
+        
+        // Calculate flow rate (pulses per minute / calibration factor)
+        current_flow_rate = (pulses * 60.0) / PULSES_PER_LITER;
+        
+        // Add to total volume (in liters)
+        total_volume += (float)pulses / PULSES_PER_LITER;
+        
+        ESP_LOGI(TAG, "Flow Rate: %.2f L/min, Total Volume: %.2f L", 
+                 current_flow_rate, total_volume);
+        
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(1000));
+    }
+}
+
+// WiFi event handler
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                    int32_t event_id, void* event_data)
+{
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "Station "MACSTR" joined, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(TAG, "Station "MACSTR" left, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    }
+}
+
+void wifi_init_softap(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                      ESP_EVENT_ANY_ID,
+                                                      &wifi_event_handler,
+                                                      NULL,
+                                                      NULL));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = EXAMPLE_ESP_WIFI_SSID,
+            .ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID),
+            .channel = EXAMPLE_ESP_WIFI_CHANNEL,
+            .password = EXAMPLE_ESP_WIFI_PASS,
+            .max_connection = EXAMPLE_MAX_STA_CONN,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                    .required = true,
+            },
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s channel:%d",
+             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS, EXAMPLE_ESP_WIFI_CHANNEL);
+}
+
+void setup_littlefs_files(void) {
+    // Create directories if they don't exist
+    mkdir("/littlefs/css", 0755);
+    mkdir("/littlefs/js", 0755);
+    mkdir("/littlefs/data", 0755);
+
+    // Array of files to verify
+    const char *files[] = {
+        "/littlefs/index.html",
+        "/littlefs/css/style.css",
+        "/littlefs/js/main.js"
+    };
+    
+    // Check if required files exist
+    struct stat st;
+    for (int i = 0; i < sizeof(files)/sizeof(files[0]); i++) {
+        if (stat(files[i], &st) != 0) {
+            ESP_LOGE(TAG, "Required file not found: %s", files[i]);
+        } else {
+            ESP_LOGI(TAG, "Found file: %s, size: %ld", files[i], st.st_size);
+        }
+    }
+
+    // List all files to verify
+    ESP_LOGI(TAG, "All files in LittleFS:");
+    list_dir("/littlefs");
+}
+
+// URI handler structure
+static const httpd_uri_t root = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = root_get_handler,
+    .user_ctx  = NULL
+};
+
+// Add a new URI handler for the data endpoint
+static const httpd_uri_t data = {
+    .uri       = "/data",
+    .method    = HTTP_GET,
+    .handler   = root_get_handler,
+    .user_ctx  = NULL
+};
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_register_uri_handler(server, &root);
+        httpd_register_uri_handler(server, &data);  // Add this line
+        ESP_LOGI(TAG, "Started HTTP server");
+    }
+    return server;
+}
+
+// Modified app_main to fix the 'ret' redefinition
+void app_main(void)
+{
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Initialize WiFi
+    wifi_init_softap();
+    
+    // Initialize LittleFS
+    ESP_LOGI(TAG, "Initializing LittleFS");
+    esp_vfs_littlefs_conf_t conf = {
+        .base_path = "/littlefs",
+        .partition_label = "storage",
+        .format_if_mount_failed = true,
+        .dont_mount = false,
+    };
+    
+    esp_err_t littlefs_ret = esp_vfs_littlefs_register(&conf);  // Changed variable name
+    if (littlefs_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount LittleFS (%s)", esp_err_to_name(littlefs_ret));
+        return;
+    }
+
+    // Get LittleFS info
+    size_t total = 0, used = 0;
+    littlefs_ret = esp_littlefs_info(conf.partition_label, &total, &used);  // Using same variable
+    if (littlefs_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get LittleFS partition info");
+    } else {
+        ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
+    }
+
+    // Setup web files
+    setup_littlefs_files();
+    
+    // Configure flow meter GPIO
+    gpio_reset_pin(PULSE_GPIO);
+    gpio_set_direction(PULSE_GPIO, GPIO_MODE_INPUT);
+    gpio_set_intr_type(PULSE_GPIO, GPIO_INTR_POSEDGE);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PULSE_GPIO, pulse_isr_handler, NULL);
+    
+    // Start flow calculation task
+    xTaskCreate(flow_calc_task, "flow_calc_task", 4096, NULL, 5, NULL);
+    
+    // Start web server
+    start_webserver();
+}

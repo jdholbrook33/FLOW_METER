@@ -1,0 +1,283 @@
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_mac.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "esp_http_server.h"
+#include "esp_system.h"
+#include "esp_netif.h"
+#include "driver/gpio.h"
+
+#define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
+#define EXAMPLE_ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
+#define EXAMPLE_ESP_WIFI_CHANNEL   CONFIG_ESP_WIFI_CHANNEL
+#define EXAMPLE_MAX_STA_CONN       CONFIG_ESP_MAX_STA_CONN
+#define PULSE_GPIO GPIO_NUM_3      // GPIO pin for pulse input
+#define PULSES_PER_LITER 300      // Flow meter calibration
+
+static const char *TAG = "FLOW_METER";
+static httpd_handle_t server = NULL;
+
+// Global variables for flow measurement
+volatile uint32_t pulse_count = 0;
+static float current_flow_rate = 0.0;
+static float total_volume = 0.0;
+
+// Modify just the html_head part to include JavaScript. The rest of your code stays the same
+static const char *html_head = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pool Flow Monitor</title>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f0f4f8; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .header { background-color: #1a73e8; color: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; text-align: center; }
+        .data-card { background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .value { font-size: 32px; font-weight: bold; color: #1a73e8; margin: 10px 0; }
+        .label { color: #5f6368; font-size: 14px; text-transform: uppercase; }
+        .refresh-button { display: block; width: 100%; padding: 10px; background-color: #1a73e8; color: white; 
+                         text-align: center; text-decoration: none; border-radius: 5px; margin-top: 20px; }
+        .refresh-button:hover { background-color: #1557b0; }
+        .update-time { text-align: center; color: #5f6368; font-size: 12px; margin-top: 10px; }
+        .auto-update { text-align: center; color: #1a73e8; font-size: 12px; margin-top: 5px; }
+    </style>
+    <script>
+        function updateData() {
+            fetch('/data')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('flow-rate').textContent = data.flow.toFixed(2);
+                    document.getElementById('total-volume').textContent = data.volume.toFixed(2);
+                    document.getElementById('update-time').textContent = data.time;
+                })
+                .catch(error => console.error('Error:', error));
+        }
+        
+        // Update every second
+        setInterval(updateData, 1000);
+    </script>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Pool Flow Monitor</h1>
+        </div>
+)rawliteral";
+
+
+static const char *html_tail = R"rawliteral(
+        <a href="/" class="refresh-button">Refresh Data</a>
+    </div>
+</body>
+</html>
+)rawliteral";
+
+// Modify the handler to also respond to data requests
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    if (strcmp(req->uri, "/data") == 0) {
+        // Return JSON data
+        char json_response[128];
+        char time_str[20];
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        strftime(time_str, sizeof(time_str), "%H:%M:%S", localtime(&tv.tv_sec));
+        
+        snprintf(json_response, sizeof(json_response),
+                "{\"flow\":%.2f,\"volume\":%.2f,\"time\":\"%s\"}",
+                current_flow_rate, total_volume, time_str);
+        
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, json_response, strlen(json_response));
+        return ESP_OK;
+    }
+
+    // Regular HTML page response
+    char flow_str[32];
+    char volume_str[32];
+    char time_str[32];
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", localtime(&tv.tv_sec));
+    
+    snprintf(flow_str, sizeof(flow_str), "%.2f", current_flow_rate);
+    snprintf(volume_str, sizeof(volume_str), "%.2f", total_volume);
+
+    httpd_resp_set_type(req, "text/html");
+    
+    httpd_resp_send_chunk(req, html_head, strlen(html_head));
+    
+    // Send flow rate card with ID for JavaScript
+    httpd_resp_send_chunk(req, "<div class=\"data-card\"><div class=\"label\">Current Flow Rate</div>"
+                              "<div class=\"value\"><span id=\"flow-rate\">", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, flow_str, strlen(flow_str));
+    httpd_resp_send_chunk(req, "</span> L/min</div></div>", HTTPD_RESP_USE_STRLEN);
+    
+    // Send volume card with ID for JavaScript
+    httpd_resp_send_chunk(req, "<div class=\"data-card\"><div class=\"label\">Total Volume</div>"
+                              "<div class=\"value\"><span id=\"total-volume\">", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, volume_str, strlen(volume_str));
+    httpd_resp_send_chunk(req, "</span> L</div></div>", HTTPD_RESP_USE_STRLEN);
+    
+    // Send update time with ID
+    httpd_resp_send_chunk(req, "<div class=\"update-time\">Last Update: <span id=\"update-time\">", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, time_str, strlen(time_str));
+    httpd_resp_send_chunk(req, "</span></div>", HTTPD_RESP_USE_STRLEN);
+    
+    // Add auto-update message
+    httpd_resp_send_chunk(req, "<div class=\"auto-update\">Auto-updating every second</div>", HTTPD_RESP_USE_STRLEN);
+    
+    httpd_resp_send_chunk(req, html_tail, strlen(html_tail));
+    
+    httpd_resp_send_chunk(req, NULL, 0);
+    
+    return ESP_OK;
+}
+
+
+// Interrupt handler for pulse counting
+void IRAM_ATTR pulse_isr_handler(void* arg) {
+    pulse_count++;
+}
+
+// Flow calculation task
+void flow_calc_task(void *pvParameters) {
+    TickType_t last_wake_time = xTaskGetTickCount();
+    uint32_t last_count = 0;
+    
+    while (1) {
+        uint32_t current_count = pulse_count;
+        uint32_t pulses = current_count - last_count;
+        last_count = current_count;
+        
+        // Calculate flow rate (pulses per minute / calibration factor)
+        current_flow_rate = (pulses * 60.0) / PULSES_PER_LITER;
+        
+        // Add to total volume (in liters)
+        total_volume += (float)pulses / PULSES_PER_LITER;
+        
+        ESP_LOGI(TAG, "Flow Rate: %.2f L/min, Total Volume: %.2f L", 
+                 current_flow_rate, total_volume);
+        
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(1000));
+    }
+}
+
+// WiFi event handler
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                    int32_t event_id, void* event_data)
+{
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "Station "MACSTR" joined, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(TAG, "Station "MACSTR" left, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    }
+}
+
+void wifi_init_softap(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                      ESP_EVENT_ANY_ID,
+                                                      &wifi_event_handler,
+                                                      NULL,
+                                                      NULL));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = EXAMPLE_ESP_WIFI_SSID,
+            .ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID),
+            .channel = EXAMPLE_ESP_WIFI_CHANNEL,
+            .password = EXAMPLE_ESP_WIFI_PASS,
+            .max_connection = EXAMPLE_MAX_STA_CONN,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                    .required = true,
+            },
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s channel:%d",
+             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS, EXAMPLE_ESP_WIFI_CHANNEL);
+}
+
+
+
+// URI handler structure
+static const httpd_uri_t root = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = root_get_handler,
+    .user_ctx  = NULL
+};
+
+// Add a new URI handler for the data endpoint
+static const httpd_uri_t data = {
+    .uri       = "/data",
+    .method    = HTTP_GET,
+    .handler   = root_get_handler,
+    .user_ctx  = NULL
+};
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_register_uri_handler(server, &root);
+        httpd_register_uri_handler(server, &data);  // Add this line
+        ESP_LOGI(TAG, "Started HTTP server");
+    }
+    return server;
+}
+
+void app_main(void)
+{
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Initialize WiFi
+    wifi_init_softap();
+    
+    // Configure flow meter GPIO
+    gpio_reset_pin(PULSE_GPIO);
+    gpio_set_direction(PULSE_GPIO, GPIO_MODE_INPUT);
+    gpio_set_intr_type(PULSE_GPIO, GPIO_INTR_POSEDGE);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PULSE_GPIO, pulse_isr_handler, NULL);
+    
+    // Start flow calculation task
+    xTaskCreate(flow_calc_task, "flow_calc_task", 4096, NULL, 5, NULL);
+    
+    // Start web server
+    start_webserver();
+}
