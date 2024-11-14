@@ -12,12 +12,7 @@
 #include "driver/gpio.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
-#include "driver/i2c.h"
-#include <time.h>
-#include <sys/time.h>
 #include "flowmeter.h"
-#include "cJSON.h"
-
 
 // Wi-Fi configuration
 #define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
@@ -25,17 +20,10 @@
 #define EXAMPLE_ESP_WIFI_CHANNEL   CONFIG_ESP_WIFI_CHANNEL
 #define EXAMPLE_MAX_STA_CONN       CONFIG_ESP_MAX_STA_CONN
 
-// I2C and RTC configuration
-#define I2C_MASTER_SCL_IO 7
-#define I2C_MASTER_SDA_IO 6
-#define I2C_MASTER_FREQ_HZ 100000
-#define I2C_MASTER_NUM 0
-#define DS3231_ADDR 0x68
-
 static const char *TAG = "wifi_softap";
 
 // Flow calculation task handle
-static TaskHandle_t flow_calc_task_handle;
+static TaskHandle_t flow_calc_task_handle = NULL;
 
 // Structure to hold flow data
 static struct {
@@ -58,79 +46,6 @@ static struct {
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
     flow_data.pulse_count++;
-}
-
-// Initialize I2C for RTC
-static esp_err_t init_i2c(void) {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_MASTER_SDA_IO,
-        .scl_io_num = I2C_MASTER_SCL_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ
-    };
-
-    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
-    if (err != ESP_OK) return err;
-
-    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
-}
-
-// Helper function to convert BCD to decimal
-static uint8_t bcd_to_dec(uint8_t bcd) {
-    return ((bcd >> 4) * 10) + (bcd & 0x0F);
-}
-
-// Sync ESP32 RTC from DS3231 with CST adjustment
-static esp_err_t sync_esp_rtc_from_external(void) {
-    uint8_t data[7];
-    
-    // Read time from external RTC
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (DS3231_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, 0x00, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (DS3231_ADDR << 1) | I2C_MASTER_READ, true);
-    i2c_master_read(cmd, data, 7, I2C_MASTER_LAST_NACK);
-    i2c_master_stop(cmd);
-    
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-
-    if (ret == ESP_OK) {
-        struct tm timeinfo = { 0 };
-        
-        // Convert to CST (-6 hours from UTC)
-        timeinfo.tm_sec = bcd_to_dec(data[0] & 0x7F);
-        timeinfo.tm_min = bcd_to_dec(data[1] & 0x7F);
-        timeinfo.tm_hour = (bcd_to_dec(data[2] & 0x3F) + 18) % 24;  // Adjust to CST
-        timeinfo.tm_mday = bcd_to_dec(data[4] & 0x3F);
-        timeinfo.tm_mon = bcd_to_dec(data[5] & 0x1F) - 1;
-        timeinfo.tm_year = bcd_to_dec(data[6]) + 100;
-
-        // Set ESP32's internal RTC
-        time_t t = mktime(&timeinfo);
-        struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
-        settimeofday(&tv, NULL);
-
-        ESP_LOGI(TAG, "ESP32 RTC synchronized with external RTC at CST");
-    }
-
-    return ret;
-}
-
-// Print current time
-static void print_time(void) {
-    time_t now;
-    struct tm timeinfo;
-    char timestr[64];
-
-    time(&now);
-    localtime_r(&now, &timeinfo);
-    strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S CST", &timeinfo);
-    // ESP_LOGI(TAG, "Current time: %s", timestr);
 }
 
 // Initialize LittleFS
@@ -257,50 +172,6 @@ static esp_err_t data_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t set_interval_handler(httpd_req_t *req)
-{
-    char buf[100];
-    int ret, remaining = req->content_len;
-
-     if (remaining >= sizeof(buf)) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Payload too large");
-        return ESP_FAIL;
-    }
-
-    ret = httpd_req_recv(req, buf, remaining);
-    if (ret <= 0) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive request");
-        return ESP_FAIL;
-    }
-
-    buf[ret] = '\0';
-    cJSON *json = cJSON_Parse(buf);
-    if (json == NULL) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
-        return ESP_FAIL;
-    }
-
-    cJSON *interval_json = cJSON_GetObjectItem(json, "interval");
-    if (cJSON_IsNumber(interval_json)) {
-        int new_interval = interval_json->valueint;
-
-       
-
-        // Update global logging interval
-        if (new_interval == 2000 || new_interval == 5000 || new_interval == 10000) {
-            ESP_LOGI(TAG, "Logging interval updated to %d ms", new_interval);
-            httpd_resp_sendstr(req, "Logging interval updated successfully");
-        } else {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid interval");
-        }
-    } else {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid interval value");
-    }
-
-    cJSON_Delete(json);
-    return ESP_OK;
-}
-
 // URI handlers
 static const httpd_uri_t file_server = {
     .uri       = "/*",
@@ -316,13 +187,6 @@ static const httpd_uri_t data_uri = {
     .user_ctx  = NULL
 };
 
-static const httpd_uri_t set_interval_uri = {
-    .uri       = "/set_interval",
-    .method    = HTTP_POST,
-    .handler   = set_interval_handler,
-    .user_ctx  = NULL
-};
-
 // Start webserver
 httpd_handle_t start_webserver(void)
 {
@@ -335,7 +199,6 @@ httpd_handle_t start_webserver(void)
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &data_uri);
         httpd_register_uri_handler(server, &file_server);
-        httpd_register_uri_handler(server, &set_interval_uri);
         return server;
     }
 
@@ -390,15 +253,13 @@ static void calculate_flow_rate(void)
 }
 
 // Flow calculation task
-static int logging_interval = 5000;  // Default interval in milliseconds
-
 static void flow_calculation_task(void *pvParameter)
 {
     TickType_t last_wake_time = xTaskGetTickCount();
     
-    while (1) {
+    while(1) {
         calculate_flow_rate();
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(logging_interval));
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(1000));
     }
 }
 
@@ -459,6 +320,17 @@ void wifi_init_softap(void)
 }
 
 // Main application entry point
+#ifdef CONFIG_FLOW_CALC_DEBUG
+static void stack_monitor_task(void *pvParameters)
+{
+    while(1) {
+        UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(flow_calc_task_handle);
+        ESP_LOGI(TAG, "Flow calc task stack high water mark: %d words", stack_hwm);
+        vTaskDelay(pdMS_TO_TICKS(10000));  // Check every 10 seconds
+    }
+}
+#endif
+
 void app_main(void)
 {
     // Initialize NVS
@@ -468,12 +340,6 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-
-    // Initialize I2C for RTC
-    ESP_ERROR_CHECK(init_i2c());
-
-    // Sync ESP32 RTC from external RTC (CST adjustment)
-    ESP_ERROR_CHECK(sync_esp_rtc_from_external());
 
     // Initialize pulse counter
     ESP_ERROR_CHECK(init_pulse_counter());
@@ -505,9 +371,15 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Flow calculation task created successfully");
 
-    // Print time periodically
-    while (1) {
-        print_time();
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    #ifdef CONFIG_FLOW_CALC_DEBUG
+    // Create stack monitoring task
+    xTaskCreate(
+        stack_monitor_task,
+        "stack_monitor",
+        2048,        // Smaller stack size is fine for monitoring
+        NULL,
+        1,          // Lower priority than flow calculation task
+        NULL
+    );
+    #endif
 }

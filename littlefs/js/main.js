@@ -10,30 +10,6 @@ function updateData() {
         .catch(error => console.error('Error:', error));
 }
 
-function setLoggingInterval() {
-    const interval = document.getElementById('logging-interval').value;
-
-    fetch('/set_interval', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ interval: parseInt(interval) })
-    })
-    .then(response => {
-        if (response.ok) {
-            alert("Logging interval updated successfully!");
-        } else {
-            alert("Failed to update logging interval.");
-        }
-    })
-    .catch(error => {
-        console.error('Error:', error);
-        alert("Error setting logging interval.");
-    });
-}
-
-
 // Update every second
 document.addEventListener('DOMContentLoaded', function() {
     // Initial update
