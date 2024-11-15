@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Pool Flow Monitor</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+    </head>
+<body>
+    <div class="container">
+        <h1>Pool Flow Monitor</h1>
+        
+        <div class="readings-grid">
+            <div class="reading-card">
+                <div class="reading-label">Current Flow Rate</div>
+                <div class="reading-value">
+                    <span id="flow-rate">0.00</span>
+                    <span class="reading-unit">L/min</span>
+                </div>
+            </div>
+            <div class="reading-card">
+                <div class="reading-label">Total Volume</div>
+                <div class="reading-value">
+                    <span id="total-volume">0.00</span>
+                    <span class="reading-unit">L</span>
+                </div>
+            </div>
+            <div class="reading-card">
+                <div class="reading-label">Last Updated</div>
+                <div class="reading-value">
+                    <span id="update-time">--:--:--</span>
+                </div>
+            </div>
+        </div>
+        <div class="controls file-controls">
+            <button onclick="downloadData()">Save to File</button>
+            <button onclick="updateData()">Refresh Data</button>
+        </div>
+        
+    </div>
+</body>
+</html>

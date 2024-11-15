@@ -1,0 +1,20 @@
+menu "Flow Sensor Configuration"
+    config FLOW_SENSOR_GPIO
+        int "Flow Sensor GPIO Pin"
+        default 3
+        help
+            GPIO number for flow sensor pulse input.
+
+    config FLOW_SENSOR_PULSES_PER_LITER
+        int "Pulses per Liter"
+        default 300
+        help
+            Number of pulses per liter of flow (sensor calibration value).
+            
+    config FLOW_SENSOR_UPDATE_INTERVAL_MS
+        int "Flow Rate Update Interval (ms)"
+        default 1000
+        range 100 10000
+        help
+            Interval in milliseconds to update flow rate calculation.
+endmenu

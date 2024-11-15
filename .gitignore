@@ -1,0 +1,31 @@
+# Ignore system and environment files
+.DS_Store
+Thumbs.db
+
+# Ignore dependency directories
+node_modules/
+vendor/
+
+# Ignore log files
+*.log
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore IDE and editor settings
+.vscode/
+.idea/
+*.swp
+
+# Ignore build directories
+dist/
+build/
+
+# Ignore environment files
+.env
+
+# ESP-IDF build files
+build/
+sdkconfig
+sdkconfig.old

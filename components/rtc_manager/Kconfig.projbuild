@@ -1,0 +1,26 @@
+
+menu "RTC Manager Configuration"
+    config I2C_MASTER_SCL
+        int "SCL GPIO Number"
+        default 7
+        help
+            GPIO number for I2C SCL.
+
+    config I2C_MASTER_SDA
+        int "SDA GPIO Number"
+        default 6
+        help
+            GPIO number for I2C SDA.
+
+    config TIMEZONE_OFFSET_HOURS
+        int "Timezone offset from UTC (hours)"
+        default -6
+        help
+            Hours to add/subtract from UTC (e.g., -6 for CST).
+
+    config I2C_MASTER_FREQ_HZ
+        int "I2C Master clock frequency"
+        default 400000
+        help
+            I2C clock frequency for master mode. (400KHz)
+endmenu
